@@ -24,7 +24,7 @@ app.use(cors());
 
 // Request Logging Middleware
 app.use((req, res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url} - Headers: ${JSON.stringify(req.headers['content-type'])}`);
   next();
 });
 
@@ -115,15 +115,18 @@ interface LedgerRecord {
 
 // --- API Routes ---
 
-app.post("/api/process", upload.fields([
+const apiRouter = express.Router();
+
+// Individual route for processing
+apiRouter.post("/process", upload.fields([
   { name: 'ledger', maxCount: 1 },
   { name: 'templateLeft', maxCount: 1 },
   { name: 'templateRight', maxCount: 1 }
 ]), async (req, res) => {
   try {
     const files = req.files as { [fieldname: string]: Express.Multer.File[] };
-    if (!files.ledger || !files.templateLeft || !files.templateRight) {
-      return res.status(400).json({ error: "Missing required files" });
+    if (!files || !files.ledger || !files.templateLeft || !files.templateRight) {
+      return res.status(400).json({ error: "Missing required files in multipart request" });
     }
 
     let data;
@@ -174,7 +177,8 @@ app.post("/api/process", upload.fields([
             const row2 = s.getRow(2);
             let hasSerialCol = false;
             row2.eachCell((cell) => {
-                if (normalizeText(cell.value).includes("资料流水号")) hasSerialCol = true;
+                const text = normalizeText(cell.value);
+                if (text.includes("资料流水号") || text.includes("流水号")) hasSerialCol = true;
             });
             if (hasSerialCol) {
                 sheetsToProcess.push(s);
@@ -184,18 +188,23 @@ app.post("/api/process", upload.fields([
     }
     
     if (sheetsToProcess.length === 0) {
-        return res.status(400).json({ error: "Could not find a valid ledger sheet." });
+        return res.status(400).json({ error: "Could not find a valid ledger sheet. Ensure row 2 contains '资料流水号'." });
     }
 
     const sheet = sheetsToProcess[0];
     const records: LedgerRecord[] = [];
     
     // Find serial column
-    let serialColIndex = 3;
+    let serialColIndex = -1;
     const headerRow = sheet.getRow(2);
     headerRow.eachCell((cell, colNumber) => {
-        if (normalizeText(cell.value).includes("资料流水号")) serialColIndex = colNumber;
+        const text = normalizeText(cell.value);
+        if (text.includes("资料流水号") || text.includes("流水号")) serialColIndex = colNumber;
     });
+
+    if (serialColIndex === -1) {
+        return res.status(400).json({ error: "Could not find '资料流水号' column in header row (Row 2)." });
+    }
 
     sheet.eachRow((row, rowNum) => {
         if (rowNum < 3 || row.hidden) return;
@@ -226,12 +235,12 @@ app.post("/api/process", upload.fields([
         }
     });
 
-    if (records.length === 0) return res.status(404).json({ error: "No records found matching serial numbers." });
+    if (records.length === 0) return res.status(404).json({ error: "No records found matching serial numbers in the ledger." });
 
     const zip = new JSZip();
     let successCount = 0;
     
-    // Optimize: Process in chunks to avoid blocking too long and speed up if possible
+    // Process records
     const CONCURRENCY = 5;
     for (let i = 0; i < records.length; i += CONCURRENCY) {
         const chunk = records.slice(i, i + CONCURRENCY);
@@ -239,7 +248,6 @@ app.post("/api/process", upload.fields([
             try {
                 const isLeft = record.turnCode.toUpperCase() === "L" || normalizeText(record.specialNote).includes("左转");
                 const templateWorkbook = new ExcelJS.Workbook();
-                // Files are in memory, loading from buffer is fast but still takes CPU
                 await templateWorkbook.xlsx.load(isLeft ? files.templateLeft[0].buffer : files.templateRight[0].buffer);
                 
                 const ws = (idx: number) => templateWorkbook.getWorksheet(idx);
@@ -297,7 +305,7 @@ app.post("/api/process", upload.fields([
         }));
     }
 
-    if (successCount === 0) return res.status(404).json({ error: "Processing failed for all records." });
+    if (successCount === 0) return res.status(500).json({ error: "Processing failed for all compatible records found." });
 
     const zipBuffer = await zip.generateAsync({ 
         type: "nodebuffer",
@@ -313,10 +321,24 @@ app.post("/api/process", upload.fields([
     res.send(zipBuffer);
 
   } catch (error: any) {
-    console.error(error);
+    console.error("Processing API Error:", error);
     res.status(500).json({ error: error.message });
   }
 });
+
+// Mounting router
+app.use("/api", apiRouter);
+
+// Global Error Handler for API
+app.use("/api", (err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    console.error(`[API ERROR] ${req.method} ${req.url}:`, err);
+    res.status(err.status || 500).json({ 
+        error: err.message || "An unexpected error occurred on the server.",
+        path: req.url,
+        method: req.method
+    });
+});
+
 
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
