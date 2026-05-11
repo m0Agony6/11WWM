@@ -11,11 +11,19 @@ const app = express();
 const PORT = 3000;
 const upload = multer({ storage: multer.memoryStorage() });
 
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(cors());
 
 // Initialize AI
-const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
+// If @google/genai is used, we'll try to support both patterns
+let model: any = null;
+try {
+    const genAI = new GoogleGenAI(process.env.GEMINI_API_KEY || "");
+    model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+} catch (e) {
+    console.error("AI Init Error:", e);
+}
 
 // --- Processing Helpers ---
 
@@ -63,7 +71,16 @@ function getReportCode(val: any): string {
 function serialMatches(cellValue: any, targetSerials: string[]): boolean {
   const left = normalizeText(cellValue);
   if (!left) return false;
-  return targetSerials.some(s => normalizeText(s) === left);
+  const leftNum = left.replace(/\D/g, "");
+  
+  return targetSerials.some(s => {
+    const right = normalizeText(s);
+    if (left === right) return true;
+    const rightNum = right.replace(/\D/g, "");
+    // If it's a numeric comparison, both must have digits
+    if (leftNum && rightNum && leftNum === rightNum) return true;
+    return false;
+  });
 }
 
 function sanitizeFileName(name: string): string {
@@ -103,7 +120,13 @@ app.post("/api/process", upload.fields([
       return res.status(400).json({ error: "Missing required files" });
     }
 
-    const { serials, config, sourceSheet } = JSON.parse(req.body.data || "{}");
+    let data;
+    try {
+        data = JSON.parse(req.body.data || "{}");
+    } catch (e) {
+        return res.status(400).json({ error: "Invalid JSON in data field" });
+    }
+    const { serials, config, sourceSheet } = data;
     const serialList: string[] = [];
     String(serials).split(/[,\s，、;；]/).filter(s => s.trim()).forEach(part => {
         if (part.includes("-")) {
@@ -202,13 +225,39 @@ app.post("/api/process", upload.fields([
     const zip = new JSZip();
     let successCount = 0;
     
+    // Load templates once
+    const workbookLeft = new ExcelJS.Workbook();
+    await workbookLeft.xlsx.load(files.templateLeft[0].buffer);
+    const workbookRight = new ExcelJS.Workbook();
+    await workbookRight.xlsx.load(files.templateRight[0].buffer);
+
     for (const record of records) {
         try {
             const isLeft = record.turnCode.toUpperCase() === "L" || normalizeText(record.specialNote).includes("左转");
-            const templateBuffer = isLeft ? files.templateLeft[0].buffer : files.templateRight[0].buffer;
+            const sourceWorkbook = isLeft ? workbookLeft : workbookRight;
+            
+            // To avoid cross-contamination of records in the same request, 
+            // we should probably write to a new workbook or carefully manage state.
+            // Since ExcelJS doesn't have a perfect "clone", we can use a trick:
+            // Write to buffer and read back, OR just use the workbook and reset values.
+            // But writing/reading is slow too.
+            // Better: use a fresh workbook and Copy sheets if possible, 
+            // but ExcelJS sheet copying is limited.
+            
+            // Actually, the most reliable way for this specific logic is to load from buffer each time,
+            // but we can optimize by loading it ONCE and potentially doing something else.
+            // HOWEVER, the "Unexpected end of JSON input" might be because the server is timing out.
+            
+            // Let's try loading it each time but maybe it was the ledger loading?
+            // No, the ledger is loaded once.
+            
+            // Wait, if I use the SAME workbook object and modify it, 
+            // the next record will see the previous record's data if it uses the same cells.
+            // Since we set values for most things, it might be okay?
+            // But safer to load from original buffer which is already in memory.
             
             const templateWorkbook = new ExcelJS.Workbook();
-            await templateWorkbook.xlsx.load(templateBuffer);
+            await templateWorkbook.xlsx.load(isLeft ? files.templateLeft[0].buffer : files.templateRight[0].buffer);
             
             const ws = (idx: number) => templateWorkbook.getWorksheet(idx);
             const rws = ws(1), sws = ws(2), hws = ws(3), pws = ws(4), mws = ws(5), cws = ws(7), fws = ws(8);
@@ -289,12 +338,21 @@ app.post("/api/process", upload.fields([
 app.post("/api/chat", async (req, res) => {
   try {
     const { message, context } = req.body;
-    const model = (genAI as any).getGenerativeModel({ model: "gemini-2.0-flash" });
-    const prompt = `Assistant context: ${JSON.stringify(context)}\nUser: ${message}\nAnswer in Chinese.`;
+    if (!message) return res.status(400).json({ error: "Message is required" });
+    
+    // Fallback if model not initialized
+    if (!model) {
+        const genAI = new GoogleGenAI(process.env.GEMINI_API_KEY || "");
+        model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    }
+
+    const prompt = `Assistant context: ${JSON.stringify(context)}\nUser: ${message}\nAnswer in Chinese concisely.`;
     const result = await model.generateContent(prompt);
+    
     res.json({ reply: result.response.text() });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    console.error("AI Chat Error:", error);
+    res.status(500).json({ error: error.message || "AI Connection Error" });
   }
 });
 
@@ -307,7 +365,8 @@ async function startServer() {
     app.use(express.static(distPath));
     app.get("*", (req, res) => res.sendFile(path.join(distPath, "index.html")));
   }
-  app.listen(PORT, "0.0.0.0", () => console.log(`Server running on http://localhost:${PORT}`));
+  const server = app.listen(PORT, "0.0.0.0", () => console.log(`Server running on http://localhost:${PORT}`));
+  server.timeout = 600000; // 10 minutes for long Excel processing
 }
 
 startServer();

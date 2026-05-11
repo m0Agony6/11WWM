@@ -88,8 +88,17 @@ export default function App() {
       });
 
       if (!response.ok) {
-        const err = await response.json();
-        throw new Error(err.error || 'Processing failed');
+        const text = await response.text();
+        let errorMsg = 'Processing failed';
+        try {
+          const err = JSON.parse(text);
+          errorMsg = err.error || errorMsg;
+        } catch (e) {
+          // If not JSON, it might be a Cloudflare error or HTML page
+          console.error("Server returned non-JSON error:", text);
+          errorMsg = `Server error (${response.status}): ${text.slice(0, 100)}...`;
+        }
+        throw new Error(errorMsg);
       }
 
       const blob = await response.blob();
@@ -118,10 +127,21 @@ export default function App() {
           context: { ledger: ledger?.name, serials, step }
         }),
       });
-      const data = await response.json();
+      
+      const text = await response.text();
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (e) {
+        console.error("AI response parse error:", text);
+        throw new Error("AI 返回了无效的响应格式");
+      }
+
+      if (!response.ok) throw new Error(data.error || "AI 连接失败");
+      
       setMessages(prev => [...prev, { role: 'ai', text: data.reply }]);
-    } catch (err) {
-      setMessages(prev => [...prev, { role: 'ai', text: "抱歉，AI连接出现问题。" }]);
+    } catch (err: any) {
+      setMessages(prev => [...prev, { role: 'ai', text: `抱歉，出现错误: ${err.message}` }]);
     }
   };
 
