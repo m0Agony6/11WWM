@@ -65,6 +65,10 @@ export default function App() {
   const chatEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
+    // Force HTTPS in production to avoid redirect-induced 405s
+    if (window.location.protocol === 'http:' && window.location.hostname !== 'localhost') {
+      window.location.href = window.location.href.replace('http:', 'https:');
+    }
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
@@ -93,17 +97,24 @@ export default function App() {
 
       if (!response.ok) {
         const text = await response.text();
-        let errorMsg = 'Processing failed';
+        let errorMsg = '处理失败';
         if (text) {
           try {
             const err = JSON.parse(text);
-            errorMsg = err.error || errorMsg;
+            errorMsg = err.error || err.message || errorMsg;
+            // Check for our custom server error
+            if (err.error === "Protocol Mismatch") {
+              errorMsg = "网络连接异常：检测到 HTTPS 重定向导致的数据丢失。请刷新页面并确保浏览器地址栏显示 HTTPS。";
+            }
           } catch (e) {
             console.error("Server returned non-JSON error:", text);
-            errorMsg = `Server error (${response.status}): ${text.slice(0, 100)}${text.length > 100 ? '...' : ''}`;
+            errorMsg = `服务器错误 (${response.status}): ${text.slice(0, 100)}${text.length > 100 ? '...' : ''}`;
+            if (response.status === 405) {
+              errorMsg += "\n(HTTP 405 通常是由于尝试通过 HTTP 发送 POST 请求而被强制跳转 HTTPS 导致的)";
+            }
           }
         } else {
-          errorMsg = `Server returned empty response (${response.status})`;
+          errorMsg = `服务器返回空响应 (${response.status})。请检查网络环境或 HTTPS 状态。`;
         }
         throw new Error(errorMsg);
       }

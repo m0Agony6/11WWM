@@ -22,9 +22,10 @@ app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ limit: '100mb', extended: true }));
 app.use(cors());
 
-// Request Logging Middleware
+// Request Logging & protocol awareness
 app.use((req, res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url} - Headers: ${JSON.stringify(req.headers['content-type'])}`);
+  const proto = req.headers['x-forwarded-proto'] || req.protocol;
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url} (Proto: ${proto})`);
   next();
 });
 
@@ -116,6 +117,18 @@ interface LedgerRecord {
 // --- API Routes ---
 
 const apiRouter = express.Router();
+
+// CORS Preflight & Protocol Diagnosis
+apiRouter.all("/process", (req, res, next) => {
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method === 'GET') {
+    return res.status(405).json({
+      error: "Protocol Mismatch",
+      message: "收到 GET 请求，但处理接口需要 POST。这通常是重定向丢失数据导致的(如 HTTP->HTTPS)。"
+    });
+  }
+  next();
+});
 
 // Individual route for processing
 apiRouter.post("/process", upload.fields([
