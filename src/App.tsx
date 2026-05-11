@@ -17,7 +17,11 @@ import {
   Trash2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
+import { GoogleGenAI } from "@google/genai";
 import { AppConfig, ChatMessage } from './types';
+
+// Initialize AI on frontend
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
 
 export default function App() {
   const [step, setStep] = useState(1);
@@ -122,32 +126,20 @@ export default function App() {
     setInput("");
 
     try {
-      const response = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          message: input,
-          context: { ledger: ledger?.name, serials, step }
-        }),
+      const response = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: `Assistant context: ${JSON.stringify({ 
+          ledger: ledger?.name, 
+          serials, 
+          step 
+        })}\nUser: ${input}\nAnswer in Chinese concisely.`
       });
       
-      const text = await response.text();
-      let data;
-      if (!text || text.trim() === "") {
-        throw new Error("AI 服务返回了空响应");
-      }
-      try {
-        data = JSON.parse(text);
-      } catch (e) {
-        console.error("AI response parse error:", text);
-        throw new Error("AI 返回了无效的响应格式 (无法解析)");
-      }
-
-      if (!response.ok) throw new Error(data.error || "AI 连接失败");
-      
-      setMessages(prev => [...prev, { role: 'ai', text: data.reply }]);
+      const reply = response.text || "AI 暂时无法回答。";
+      setMessages(prev => [...prev, { role: 'ai', text: reply }]);
     } catch (err: any) {
-      setMessages(prev => [...prev, { role: 'ai', text: `抱歉，出现错误: ${err.message}` }]);
+      console.error("AI Error:", err);
+      setMessages(prev => [...prev, { role: 'ai', text: `错误: ${err.message}` }]);
     }
   };
 

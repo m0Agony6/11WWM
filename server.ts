@@ -4,19 +4,32 @@ import path from "path";
 import multer from "multer";
 import ExcelJS from "exceljs";
 import JSZip from "jszip";
-import { GoogleGenAI } from "@google/genai";
 import cors from "cors";
 
 const app = express();
 const PORT = 3000;
-const upload = multer({ storage: multer.memoryStorage() });
 
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+// API Health Check
+app.get("/api/health", (req, res) => {
+  res.json({ status: "ok", time: new Date().toISOString() });
+});
+const upload = multer({ 
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 100 * 1024 * 1024 } // 100MB
+});
+
+app.use(express.json({ limit: '100mb' }));
+app.use(express.urlencoded({ limit: '100mb', extended: true }));
 app.use(cors());
 
+// Request Logging Middleware
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+  next();
+});
+
 // Initialize AI
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
+// Backend AI removed to follow frontend-only guidelines for Gemini SDK
 
 // --- Processing Helpers ---
 
@@ -305,29 +318,6 @@ app.post("/api/process", upload.fields([
   }
 });
 
-// AI Assistant
-app.post("/api/chat", async (req, res) => {
-  try {
-    const { message, context } = req.body;
-    if (!message) return res.status(400).json({ error: "Message is required" });
-    
-    if (!process.env.GEMINI_API_KEY) {
-        return res.status(503).json({ error: "AI service not configured on server" });
-    }
-
-    const prompt = `Assistant context: ${JSON.stringify(context)}\nUser: ${message}\nAnswer in Chinese concisely.`;
-    const result = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
-        contents: prompt
-    });
-    
-    res.json({ reply: result.text || "AI 暂时无法回答。" });
-  } catch (error: any) {
-    console.error("AI Chat Error:", error);
-    res.status(500).json({ error: error.message || "AI Connection Error" });
-  }
-});
-
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
@@ -337,8 +327,13 @@ async function startServer() {
     app.use(express.static(distPath));
     app.get("*", (req, res) => res.sendFile(path.join(distPath, "index.html")));
   }
-  const server = app.listen(PORT, "0.0.0.0", () => console.log(`Server running on http://localhost:${PORT}`));
-  server.timeout = 600000; // 10 minutes for long Excel processing
+  const server = app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+    console.log(`Cloud Runtime Mode: ${process.env.NODE_ENV}`);
+  });
+  server.timeout = 600000; // 10 minutes
+  server.keepAliveTimeout = 65000;
+  server.headersTimeout = 70000;
 }
 
 startServer();
