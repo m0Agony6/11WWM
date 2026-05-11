@@ -16,14 +16,7 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(cors());
 
 // Initialize AI
-// If @google/genai is used, we'll try to support both patterns
-let model: any = null;
-try {
-    const genAI = new GoogleGenAI(process.env.GEMINI_API_KEY || "");
-    model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-} catch (e) {
-    console.error("AI Init Error:", e);
-}
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
 
 // --- Processing Helpers ---
 
@@ -225,92 +218,70 @@ app.post("/api/process", upload.fields([
     const zip = new JSZip();
     let successCount = 0;
     
-    // Load templates once
-    const workbookLeft = new ExcelJS.Workbook();
-    await workbookLeft.xlsx.load(files.templateLeft[0].buffer);
-    const workbookRight = new ExcelJS.Workbook();
-    await workbookRight.xlsx.load(files.templateRight[0].buffer);
+    // Optimize: Process in chunks to avoid blocking too long and speed up if possible
+    const CONCURRENCY = 5;
+    for (let i = 0; i < records.length; i += CONCURRENCY) {
+        const chunk = records.slice(i, i + CONCURRENCY);
+        await Promise.all(chunk.map(async (record) => {
+            try {
+                const isLeft = record.turnCode.toUpperCase() === "L" || normalizeText(record.specialNote).includes("左转");
+                const templateWorkbook = new ExcelJS.Workbook();
+                // Files are in memory, loading from buffer is fast but still takes CPU
+                await templateWorkbook.xlsx.load(isLeft ? files.templateLeft[0].buffer : files.templateRight[0].buffer);
+                
+                const ws = (idx: number) => templateWorkbook.getWorksheet(idx);
+                const rws = ws(1), sws = ws(2), hws = ws(3), pws = ws(4), mws = ws(5), cws = ws(7), fws = ws(8);
 
-    for (const record of records) {
-        try {
-            const isLeft = record.turnCode.toUpperCase() === "L" || normalizeText(record.specialNote).includes("左转");
-            const sourceWorkbook = isLeft ? workbookLeft : workbookRight;
-            
-            // To avoid cross-contamination of records in the same request, 
-            // we should probably write to a new workbook or carefully manage state.
-            // Since ExcelJS doesn't have a perfect "clone", we can use a trick:
-            // Write to buffer and read back, OR just use the workbook and reset values.
-            // But writing/reading is slow too.
-            // Better: use a fresh workbook and Copy sheets if possible, 
-            // but ExcelJS sheet copying is limited.
-            
-            // Actually, the most reliable way for this specific logic is to load from buffer each time,
-            // but we can optimize by loading it ONCE and potentially doing something else.
-            // HOWEVER, the "Unexpected end of JSON input" might be because the server is timing out.
-            
-            // Let's try loading it each time but maybe it was the ledger loading?
-            // No, the ledger is loaded once.
-            
-            // Wait, if I use the SAME workbook object and modify it, 
-            // the next record will see the previous record's data if it uses the same cells.
-            // Since we set values for most things, it might be okay?
-            // But safer to load from original buffer which is already in memory.
-            
-            const templateWorkbook = new ExcelJS.Workbook();
-            await templateWorkbook.xlsx.load(isLeft ? files.templateLeft[0].buffer : files.templateRight[0].buffer);
-            
-            const ws = (idx: number) => templateWorkbook.getWorksheet(idx);
-            const rws = ws(1), sws = ws(2), hws = ws(3), pws = ws(4), mws = ws(5), cws = ws(7), fws = ws(8);
-
-            const ringPadded = record.ring.replace(/\D/g, "").padStart(5, '0');
-            const ringNumeric = parseInt(record.ring.replace(/\D/g, "")) || record.ring;
-            
-            if(rws) {
-                rws.getCell("G1").value = record.serial;
-                const ringDesc = normalizeText(record.specialNote).includes("标准") ? "直线环" : (normalizeText(record.specialNote) || "直线环");
-                rws.getCell("D4").value = `第${ringPadded}环${record.steelModel}型${ringDesc}`;
-                const prefixes = config.reportPrefixes || { "G8": "07062500C700308", "G9": "07062500C700309", "G10": "07062500C700311", "G11": "07062500C700310", "G12": "07062500C500100", "G15": "07062500C511100" };
-                Object.entries(prefixes).forEach(([cell, pre]) => { rws.getCell(cell).value = `${pre}${ringPadded}`; });
-                const supervisors = config.supervisors || {};
-                if (supervisors[record.sheetName]) rws.getCell("B28").value = supervisors[record.sheetName];
-            }
-            if(sws) { sws.getCell("D4").value = ringNumeric; sws.getCell("P3").value = record.productionDate; }
-            if(hws) {
-                hws.getCell("A14").value = `规格型号:HRB400E 20 复试报告编号：${record.report20}`;
-                hws.getCell("A15").value = `规格型号:HRB400E 12 复试报告编号：${record.report12}`;
-                hws.getCell("A16").value = `规格型号：HPB300 10 复试报告编号：${record.report10}`;
-                hws.getCell("A17").value = `规格型号：HPB300 8  复试报告编号：${record.report8}`;
-                hws.getCell("A18").value = `规格型号：HPB300 6  复试报告编号：${record.report6}`;
-                hws.getCell("I3").value = record.productionDate; hws.getCell("I4").value = ringNumeric;
-            }
-            if(pws) {
-                pws.getCell("B10").value = `第${ringPadded}环`; pws.getCell("B12").value = ringNumeric; pws.getCell("B22").value = `${ringPadded}-02`; pws.getCell("B32").value = ringNumeric;
-                pws.getCell("B6").value = record.productionDate; pws.getCell("B16").value = record.productionDate; pws.getCell("B20").value = `第${ringPadded}环`; pws.getCell("B26").value = record.productionDate; pws.getCell("B30").value = `第${ringPadded}环`;
-            }
-            if(mws) {
-                const moldSuffix = isLeft ? "L" : (record.turnCode.toUpperCase() === "R" || normalizeText(record.specialNote).includes("右转") ? "R" : "");
-                const moldPrefixes = config.moldPrefixes || { "D4": "B1", "F4": "B2", "H4": "B3", "J4": "L1", "L4": "L2", "O4": "F" };
-                Object.entries(moldPrefixes).forEach(([cell, pre]) => { mws.getCell(cell).value = `${pre}${moldSuffix}-01`; });
-                mws.getCell("O3").value = record.productionDate;
-            }
-            if(cws && record.sprayDate && record.curingStart) {
-                const startDt = new Date(record.sprayDate);
-                startDt.setHours(record.curingStart.h, record.curingStart.m, 0, 0);
-                for(let i = 0; i < 5; i++) {
-                    const row = 6 + i; const dt = new Date(startDt.getTime() + i * 60 * 60 * 1000);
-                    cws.getCell(`A${row}`).value = dt.getFullYear(); cws.getCell(`B${row}`).value = dt.getMonth() + 1; cws.getCell(`C${row}`).value = dt.getDate();
-                    cws.getCell(`D${row}`).value = dt; cws.getCell(`D${row}`).numFmt = "h:mm";
+                const ringPadded = record.ring.replace(/\D/g, "").padStart(5, '0');
+                const ringNumeric = parseInt(record.ring.replace(/\D/g, "")) || record.ring;
+                
+                if(rws) {
+                    rws.getCell("G1").value = record.serial;
+                    const ringDesc = normalizeText(record.specialNote).includes("标准") ? "直线环" : (normalizeText(record.specialNote) || "直线环");
+                    rws.getCell("D4").value = `第${ringPadded}环${record.steelModel}型${ringDesc}`;
+                    const prefixes = config.reportPrefixes || { "G8": "07062500C700308", "G9": "07062500C700309", "G10": "07062500C700311", "G11": "07062500C700310", "G12": "07062500C500100", "G15": "07062500C511100" };
+                    Object.entries(prefixes).forEach(([cell, pre]) => { rws.getCell(cell).value = `${pre}${ringPadded}`; });
+                    const supervisors = config.supervisors || {};
+                    if (supervisors[record.sheetName]) rws.getCell("B28").value = supervisors[record.sheetName];
                 }
-            }
-            if(fws) { fws.getCell("P2").value = record.sprayDate; }
+                if(sws) { sws.getCell("D4").value = ringNumeric; sws.getCell("P3").value = record.productionDate; }
+                if(hws) {
+                    hws.getCell("A14").value = `规格型号:HRB400E 20 复试报告编号：${record.report20}`;
+                    hws.getCell("A15").value = `规格型号:HRB400E 12 复试报告编号：${record.report12}`;
+                    hws.getCell("A16").value = `规格型号：HPB300 10 复试报告编号：${record.report10}`;
+                    hws.getCell("A17").value = `规格型号：HPB300 8  复试报告编号：${record.report8}`;
+                    hws.getCell("A18").value = `规格型号：HPB300 6  复试报告编号：${record.report6}`;
+                    hws.getCell("I3").value = record.productionDate; hws.getCell("I4").value = ringNumeric;
+                }
+                if(pws) {
+                    pws.getCell("B10").value = `第${ringPadded}环`; pws.getCell("B12").value = ringNumeric; pws.getCell("B22").value = `${ringPadded}-02`; pws.getCell("B32").value = ringNumeric;
+                    pws.getCell("B6").value = record.productionDate; pws.getCell("B16").value = record.productionDate; pws.getCell("B20").value = `第${ringPadded}环`; pws.getCell("B26").value = record.productionDate; pws.getCell("B30").value = `第${ringPadded}环`;
+                }
+                if(mws) {
+                    const moldSuffix = isLeft ? "L" : (record.turnCode.toUpperCase() === "R" || normalizeText(record.specialNote).includes("右转") ? "R" : "");
+                    const moldPrefixes = config.moldPrefixes || { "D4": "B1", "F4": "B2", "H4": "B3", "J4": "L1", "L4": "L2", "O4": "F" };
+                    Object.entries(moldPrefixes).forEach(([cell, pre]) => { mws.getCell(cell).value = `${pre}${moldSuffix}-01`; });
+                    mws.getCell("O3").value = record.productionDate;
+                }
+                if(cws && record.sprayDate && record.curingStart) {
+                    const startDt = new Date(record.sprayDate);
+                    startDt.setHours(record.curingStart.h, record.curingStart.m, 0, 0);
+                    for(let i = 0; i < 5; i++) {
+                        const row = 6 + i; const dt = new Date(startDt.getTime() + i * 60 * 60 * 1000);
+                        cws.getCell(`A${row}`).value = dt.getFullYear(); cws.getCell(`B${row}`).value = dt.getMonth() + 1; cws.getCell(`C${row}`).value = dt.getDate();
+                        cws.getCell(`D${row}`).value = dt; cws.getCell(`D${row}`).numFmt = "h:mm";
+                    }
+                }
+                if(fws) { fws.getCell("P2").value = record.sprayDate; }
 
-            const outBuffer = await templateWorkbook.xlsx.writeBuffer();
-            const fileName = sanitizeFileName(`管片检验批-${record.serial}-${ringNumeric}.xlsx`);
-            zip.file(fileName, outBuffer as Buffer);
-            successCount++;
-        } catch (e) {
-            console.error(`Error processing ${record.serial}:`, e);
-        }
+                const outBuffer = await templateWorkbook.xlsx.writeBuffer();
+                const fileName = sanitizeFileName(`管片检验批-${record.serial}-${ringNumeric}.xlsx`);
+                zip.file(fileName, outBuffer as Buffer);
+                successCount++;
+            } catch (e) {
+                console.error(`Error processing ${record.serial}:`, e);
+            }
+        }));
     }
 
     if (successCount === 0) return res.status(404).json({ error: "Processing failed for all records." });
@@ -340,16 +311,17 @@ app.post("/api/chat", async (req, res) => {
     const { message, context } = req.body;
     if (!message) return res.status(400).json({ error: "Message is required" });
     
-    // Fallback if model not initialized
-    if (!model) {
-        const genAI = new GoogleGenAI(process.env.GEMINI_API_KEY || "");
-        model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    if (!process.env.GEMINI_API_KEY) {
+        return res.status(503).json({ error: "AI service not configured on server" });
     }
 
     const prompt = `Assistant context: ${JSON.stringify(context)}\nUser: ${message}\nAnswer in Chinese concisely.`;
-    const result = await model.generateContent(prompt);
+    const result = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: prompt
+    });
     
-    res.json({ reply: result.response.text() });
+    res.json({ reply: result.text || "AI 暂时无法回答。" });
   } catch (error: any) {
     console.error("AI Chat Error:", error);
     res.status(500).json({ error: error.message || "AI Connection Error" });

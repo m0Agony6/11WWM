@@ -90,13 +90,16 @@ export default function App() {
       if (!response.ok) {
         const text = await response.text();
         let errorMsg = 'Processing failed';
-        try {
-          const err = JSON.parse(text);
-          errorMsg = err.error || errorMsg;
-        } catch (e) {
-          // If not JSON, it might be a Cloudflare error or HTML page
-          console.error("Server returned non-JSON error:", text);
-          errorMsg = `Server error (${response.status}): ${text.slice(0, 100)}...`;
+        if (text) {
+          try {
+            const err = JSON.parse(text);
+            errorMsg = err.error || errorMsg;
+          } catch (e) {
+            console.error("Server returned non-JSON error:", text);
+            errorMsg = `Server error (${response.status}): ${text.slice(0, 100)}${text.length > 100 ? '...' : ''}`;
+          }
+        } else {
+          errorMsg = `Server returned empty response (${response.status})`;
         }
         throw new Error(errorMsg);
       }
@@ -130,11 +133,14 @@ export default function App() {
       
       const text = await response.text();
       let data;
+      if (!text || text.trim() === "") {
+        throw new Error("AI 服务返回了空响应");
+      }
       try {
         data = JSON.parse(text);
       } catch (e) {
         console.error("AI response parse error:", text);
-        throw new Error("AI 返回了无效的响应格式");
+        throw new Error("AI 返回了无效的响应格式 (无法解析)");
       }
 
       if (!response.ok) throw new Error(data.error || "AI 连接失败");
